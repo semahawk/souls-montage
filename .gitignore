@@ -127,3 +127,9 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+.vscode
+
+# clips used for development
+devclips/*
+!devclips/.gitkeep
