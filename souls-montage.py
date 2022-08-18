@@ -15,6 +15,7 @@ from game_config import *
 
 THREADS_NUM = 3
 RESIZE_FACTOR = 0.6
+FRAMES_TO_END_ATTEMPT = 40  # TODO base it on video's fps
 
 config = GAME_CONFIG["bloodborne"]
 
@@ -50,11 +51,12 @@ def process_frame(frame):
     boss_bar_bottom = int(height * config["boss_bar_y_end_pct"])
     boss_bar_left = int(width * config["boss_bar_x_start_pct"])
     boss_bar_right = int(width * config["boss_bar_x_end_pct"])
-    boss_bar = getsubframe(frame,
+    boss_bar = getsubframe(
+        frame,
         boss_bar_left,
         boss_bar_top,
         boss_bar_right - int((boss_bar_right - boss_bar_left) / 2),
-        boss_bar_bottom - int((boss_bar_bottom - boss_bar_top) / 2)
+        boss_bar_bottom - int((boss_bar_bottom - boss_bar_top) / 2),
     )
 
     match = cv2.matchTemplate(boss_bar, tmpl, cv2.TM_CCORR_NORMED)
@@ -74,20 +76,32 @@ def print_results():
     attempts = []
     last_attempt_start = -1
     state = State.NO_BOSS
+    frames_without_boss = 0
 
     for frame in tqdm(sorted(boss_in_frame.keys()), desc="Processing frame data"):
-        if state == State.NO_BOSS and boss_in_frame[frame] == True:
-            last_attempt_start = frame_to_ms(frame)
+        if boss_in_frame[frame]:
+            frames_without_boss = 0
+        else:
+            frames_without_boss += 1
+
+        if state == State.NO_BOSS and boss_in_frame[frame]:
+            last_attempt_start = frame
             state = State.BOSS_ACTIVE
-        if state == State.BOSS_ACTIVE and boss_in_frame[frame] == False:
-            end = frame_to_ms(frame)
+            print(f"attempt started in frame {frame}")
+        if (
+            state == State.BOSS_ACTIVE
+            and not boss_in_frame[frame]
+            and frames_without_boss >= FRAMES_TO_END_ATTEMPT
+        ):
+            end = frame
             attempts.append((last_attempt_start, end))
             state = State.NO_BOSS
+            print(f"attempt ended in frame {frame}")
 
     print()
     for idx, attempt in enumerate(attempts):
-        start = attempt[0]
-        end = attempt[1]
+        start = frame_to_ms(attempt[0])
+        end = frame_to_ms(attempt[1])
         length = (end - start) / 1000
 
         print(f"Attempt #{idx + 1}: took {length}ms ({start}-{end}ms)")
