@@ -133,3 +133,5 @@ dmypy.json
 # clips used for development
 devclips/*
 !devclips/.gitkeep
+
+.frame_data.log
