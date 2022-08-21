@@ -9,12 +9,11 @@ import numpy as np
 import cv2
 from tqdm import tqdm
 
+from boss_config import *
 from game_config import *
 
 RESIZE_FACTOR = 0.6
 MIN_MS_BETWEEN_ATTEMPTS = 5 * 1000  # 5 seconds
-
-game_config = GAME_CONFIG["bloodborne"]
 
 
 def hex_to_cv2_color(hex_: int):
@@ -30,17 +29,6 @@ def ms_to_hms(ms: int):
     h = math.floor(m / 60)
 
     return "{:02d}:{:02d}:{:02d}".format(h, m % 60, s % 60)
-
-
-def get_box(frame, which: str):
-    height, width = frame.shape[0], frame.shape[1]
-
-    y1 = int(height * game_config[f"{which}_y_start_pct"])
-    y2 = int(height * game_config[f"{which}_y_end_pct"])
-    x1 = int(width * game_config[f"{which}_x_start_pct"])
-    x2 = int(width * game_config[f"{which}_x_end_pct"])
-
-    return frame[y1:y2, x1:x2]
 
 
 class FrameData:
@@ -68,18 +56,21 @@ class FrameData:
 class VideoProcessor:
     _frame_data: dict[int, FrameData] = {}
 
-    def __init__(self, boss=None):
+    def __init__(self, boss):
         self.last_frame_idx = 0
 
+        self.boss_config = BOSS_CONFIG[boss]
+        self.game_config = GAME_CONFIG[self.boss_config["game"]]
+
         self.boss_name_tmpl = cv2.imread(
-            "templates/bloodborne/ludwig_the_accursed.png", cv2.IMREAD_UNCHANGED
+            self.boss_config["boss_name_tmpl"], cv2.IMREAD_UNCHANGED
         )
         self.boss_name_tmpl = cv2.resize(
             self.boss_name_tmpl, (0, 0), fx=RESIZE_FACTOR, fy=RESIZE_FACTOR
         )
 
         self.you_died_tmpl = cv2.imread(
-            "templates/bloodborne/you_died.png", cv2.IMREAD_UNCHANGED
+            self.game_config["you_died_tmpl"], cv2.IMREAD_UNCHANGED
         )
         self.you_died_tmpl = cv2.resize(
             self.you_died_tmpl, (0, 0), fx=RESIZE_FACTOR, fy=RESIZE_FACTOR
@@ -90,6 +81,16 @@ class VideoProcessor:
 
     def ms_to_frames(self, ms: int):
         return int(ms * (self.frames_per_sec / 1000))
+
+    def get_box(self, frame, which: str):
+        height, width = frame.shape[0], frame.shape[1]
+
+        y1 = int(height * self.game_config[f"{which}_y_start_pct"])
+        y2 = int(height * self.game_config[f"{which}_y_end_pct"])
+        x1 = int(width * self.game_config[f"{which}_x_start_pct"])
+        x2 = int(width * self.game_config[f"{which}_x_end_pct"])
+
+        return frame[y1:y2, x1:x2]
 
     def process_video(self, filename):
         cap = cv2.VideoCapture(filename)
@@ -123,19 +124,19 @@ class VideoProcessor:
         _boss_name_tmpl = cv2.cvtColor(self.boss_name_tmpl, cv2.COLOR_BGR2GRAY)
         _you_died_tmpl = cv2.cvtColor(self.you_died_tmpl, cv2.COLOR_BGR2GRAY)
 
-        you_died_box = get_box(frame, "you_died")
+        you_died_box = self.get_box(frame, "you_died")
         match = cv2.matchTemplate(you_died_box, _you_died_tmpl, cv2.TM_CCOEFF_NORMED)
         if np.amax(match) > 0.5:
             frame_data.you_died_visible = True
 
         # try to find the boss' name
-        boss_bar_box = get_box(frame, "boss_bar")
+        boss_bar_box = self.get_box(frame, "boss_bar")
         match = cv2.matchTemplate(boss_bar_box, _boss_name_tmpl, cv2.TM_CCORR_NORMED)
         boss_active_confidence = np.amax(match)
 
         # and try to see if the boss' hp bar is active
         # by checking the dominant color of this area and checking if in range
-        boss_hp_bar_box = get_box(orig_frame, "boss_hp_bar")
+        boss_hp_bar_box = self.get_box(orig_frame, "boss_hp_bar")
         boss_hp_bar_data = np.reshape(boss_hp_bar_box, (-1, 3))
         boss_hp_bar_data = np.float32(boss_hp_bar_data)
 
@@ -146,8 +147,12 @@ class VideoProcessor:
         img = np.ones((1, 1, 3), dtype=np.uint8)
         img[:, :] = centers[0]
 
-        lowerb = hex_to_cv2_color(game_config["boss_bar_dominant_color_lower_bound"])
-        upperb = hex_to_cv2_color(game_config["boss_bar_dominant_color_upper_bound"])
+        lowerb = hex_to_cv2_color(
+            self.game_config["boss_bar_dominant_color_lower_bound"]
+        )
+        upperb = hex_to_cv2_color(
+            self.game_config["boss_bar_dominant_color_upper_bound"]
+        )
         mask = cv2.inRange(img, lowerb, upperb)
 
         # bump the confidence by a fair amount if the dominant color of the boss' hp
@@ -230,12 +235,16 @@ class VideoProcessor:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Souls montage")
-    parser.add_argument('input_videos', metavar='video', type=str, nargs='+',
-                    help='video(s) to process')
+    parser.add_argument(
+        "input_videos", metavar="video", type=str, nargs="+", help="video(s) to process"
+    )
+    parser.add_argument(
+        "-b", "--boss", type=str, choices=BOSS_CONFIG.keys(), required=True
+    )
 
     args = parser.parse_args()
 
-    processor = VideoProcessor()
+    processor = VideoProcessor(args.boss)
 
     for file in args.input_videos:
         processor.process_video(file)
