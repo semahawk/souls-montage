@@ -17,5 +17,7 @@ GAME_CONFIG = {
 
     "boss_bar_dominant_color_lower_bound": 0x823c14,
     "boss_bar_dominant_color_upper_bound": 0xcf5e25,
+
+    "you_died_tmpl": "templates/bloodborne/you_died.png",
   }
 }
