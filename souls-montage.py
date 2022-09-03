@@ -4,6 +4,7 @@
 import math
 import argparse
 from enum import Enum
+import statistics
 
 import numpy as np
 import cv2
@@ -189,10 +190,13 @@ class VideoProcessor:
         class State(Enum):
             NO_BOSS = 0
             ATTEMPT_STARTED = 1
+            CURRENTLY_DYING = 2
 
         state = State.NO_BOSS
         attempts = []
         last_attempt_start = -1
+        you_died_start_frame_idx = -1
+        you_died_boss_hps = []
 
         logfile = open(".frame_data.log", "w")
 
@@ -216,10 +220,23 @@ class VideoProcessor:
                     last_attempt_start = frame_idx
                     state = State.ATTEMPT_STARTED
 
-            if state == State.ATTEMPT_STARTED and frame.you_died_visible:
-                end = frame_idx
-                attempts.append((last_attempt_start, end, frame.boss_hp_pct))
-                state = State.NO_BOSS
+            elif state == State.ATTEMPT_STARTED and frame.you_died_visible:
+                you_died_start_frame_idx = frame_idx
+                state = State.CURRENTLY_DYING
+
+            elif state == State.CURRENTLY_DYING:
+                if frame.you_died_visible:
+                    you_died_boss_hps.append(frame.boss_hp_pct)
+                else:
+                    # decide the final boss hp based on what number comes up
+                    # most often in the frame data while "YOU DIED" is visible
+                    # this is to prevent misreads on single frames to mess with
+                    # the final reading
+                    final_boss_hp = statistics.mode(you_died_boss_hps)
+                    you_died_boss_hps = []
+
+                    attempts.append((last_attempt_start, you_died_start_frame_idx, final_boss_hp))
+                    state = State.NO_BOSS
 
         logfile.close()
 
