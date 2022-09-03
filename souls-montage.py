@@ -134,13 +134,13 @@ def process_frame(orig_frame, frame_idx) -> FrameData:
         frame_data.boss_active = True
 
     # calculate how much hp the boss has (if decently confident that boss is active)
-    if boss_active_confidence > 0.5:
+    if boss_active_confidence > 0.85:
         # when YOU DIED is visible then the screen has a semi-transparent overlay
         # making the white more gray
         if frame_data.you_died_visible:
-            white_lowerb, white_upperb = (115, 115, 115), (125, 125, 125)
+            white_lowerb, white_upperb = (50, 50, 50), (150, 150, 150)
         else:
-            white_lowerb, white_upperb = (220, 220, 220), (255, 255, 255)
+            white_lowerb, white_upperb = (180, 180, 180), (255, 255, 255)
 
         # extract the white/gray tip(s)
         whites = cv2.inRange(boss_hp_bar_box, white_lowerb, white_upperb)
@@ -150,7 +150,7 @@ def process_frame(orig_frame, frame_idx) -> FrameData:
         # encounter any white pixels
         for x in reversed(range(1, w)):
             if np.count_nonzero(whites[:, x - 1 : x] > 0):
-                frame_data.boss_hp_pct = x / w * 100
+                frame_data.boss_hp_pct = round(x / w * 100)
                 break
 
     return frame_data

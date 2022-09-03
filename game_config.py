@@ -11,7 +11,7 @@ GAME_CONFIG = {
     "boss_bar_y_end_pct": 0.885,
 
     "boss_hp_bar_x_start_pct": 0.175,
-    "boss_hp_bar_x_end_pct": 0.829166666667,
+    "boss_hp_bar_x_end_pct": 0.830729166667,
     "boss_hp_bar_y_start_pct": 0.859259259259,
     "boss_hp_bar_y_end_pct": 0.863888888889,
 
