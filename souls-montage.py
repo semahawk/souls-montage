@@ -3,7 +3,6 @@
 
 import os
 import glob
-import concurrent.futures
 from enum import Enum
 
 import numpy as np
@@ -13,13 +12,12 @@ from tqdm import tqdm
 
 from game_config import *
 
-THREADS_NUM = 3
 RESIZE_FACTOR = 0.6
-FRAMES_TO_END_ATTEMPT = 40  # TODO base it on video's fps
+MIN_MS_BETWEEN_ATTEMPTS = 5 * 1000  # 5 seconds
 
-config = GAME_CONFIG["bloodborne"]
+game_config = GAME_CONFIG["bloodborne"]
 
-vfile = glob.glob("devclips/*.mp4")[0]
+vfile = sorted(glob.glob("devclips/*.mp4"))[0]
 
 cap = cv2.VideoCapture(vfile)
 
@@ -29,74 +27,100 @@ frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 tmpl = cv2.imread("templates/bloodborne/ludwig_the_accursed.png", cv2.IMREAD_GRAYSCALE)
 tmpl = cv2.resize(tmpl, (0, 0), fx=RESIZE_FACTOR, fy=RESIZE_FACTOR)
 
-# [frame index] = True/False if the boss is active in that frame
-boss_in_frame = {}
+you_died_tmpl = cv2.imread("templates/bloodborne/you_died.png", cv2.IMREAD_GRAYSCALE)
+you_died_tmpl = cv2.resize(you_died_tmpl, (0, 0), fx=RESIZE_FACTOR, fy=RESIZE_FACTOR)
 
 
-def frame_to_ms(frame_idx):
+class FrameData:
+    def __init__(
+        self, frame_idx, boss_active=False, boss_hp_pct=-1, you_died_visible=False
+    ):
+        self.frame_idx = frame_idx
+        self.boss_active = boss_active
+        self.boss_hp_pct = boss_hp_pct
+        self.you_died_visible = you_died_visible
+
+    def __repr__(self):
+        return "-{}--{}-{}--{}--".format(
+            str(self.frame_idx).center(8, "-"),
+            "BOSS" if self.boss_active else "----",
+            str(self.boss_hp_pct).rjust(4, "-") if self.boss_active else "----",
+            "DIED" if self.you_died_visible else "----",
+        )
+
+
+frame_data: dict[int, FrameData] = {}
+
+
+def frame_to_ms(frame_idx: int):
     return int(frame_idx * (1 / frames_per_sec) * 1000)
 
 
-def getsubframe(frame, x1, y1, x2, y2):
-    return np.asarray([row[x1:x2] for row in frame[y1:y2]])
+def ms_to_frames(ms: int):
+    return int(ms * (frames_per_sec / 1000))
 
 
-def process_frame(frame):
+def get_box(frame, which: str):
+    height, width = frame.shape[0], frame.shape[1]
+
+    y1 = int(height * game_config[f"{which}_y_start_pct"])
+    y2 = int(height * game_config[f"{which}_y_end_pct"])
+    x1 = int(width * game_config[f"{which}_x_start_pct"])
+    x2 = int(width * game_config[f"{which}_x_end_pct"])
+
+    return frame[y1:y2, x1:x2]
+
+
+def process_frame(frame, frame_idx) -> FrameData:
+    frame_data = FrameData(frame_idx)
+
     frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     frame = cv2.resize(frame, (0, 0), fx=RESIZE_FACTOR, fy=RESIZE_FACTOR)
 
-    height, width = frame.shape
+    you_died_box = get_box(frame, "you_died")
+    match = cv2.matchTemplate(you_died_box, you_died_tmpl, cv2.TM_CCOEFF_NORMED)
+    if np.amax(match) > 0.5:
+        frame_data.you_died_visible = True
 
-    boss_bar_top = int(height * config["boss_bar_y_start_pct"])
-    boss_bar_bottom = int(height * config["boss_bar_y_end_pct"])
-    boss_bar_left = int(width * config["boss_bar_x_start_pct"])
-    boss_bar_right = int(width * config["boss_bar_x_end_pct"])
-    boss_bar = getsubframe(
-        frame,
-        boss_bar_left,
-        boss_bar_top,
-        boss_bar_right - int((boss_bar_right - boss_bar_left) / 2),
-        boss_bar_bottom - int((boss_bar_bottom - boss_bar_top) / 2),
-    )
+    boss_bar_box = get_box(frame, "boss_bar")
+    match = cv2.matchTemplate(boss_bar_box, tmpl, cv2.TM_CCORR_NORMED)
+    if np.amax(match) > 0.75:
+        frame_data.boss_active = True
 
-    match = cv2.matchTemplate(boss_bar, tmpl, cv2.TM_CCORR_NORMED)
-
-    threshold = 0.85
-    if np.amax(match) > threshold:
-        return True
-
-    return False
+    return frame_data
 
 
 def print_results():
     class State(Enum):
         NO_BOSS = 0
-        BOSS_ACTIVE = 1
+        ATTEMPT_STARTED = 1
 
+    state = State.NO_BOSS
     attempts = []
     last_attempt_start = -1
-    state = State.NO_BOSS
     frames_without_boss = 0
 
-    for frame in tqdm(sorted(boss_in_frame.keys()), desc="Processing frame data"):
-        if boss_in_frame[frame]:
+    for frame in tqdm(sorted(frame_data.keys()), desc="Processing frame data"):
+        if frame_data[frame].boss_active:
             frames_without_boss = 0
         else:
             frames_without_boss += 1
 
-        if state == State.NO_BOSS and boss_in_frame[frame]:
-            last_attempt_start = frame
-            state = State.BOSS_ACTIVE
-            print(f"attempt started in frame {frame}")
-        if (
-            state == State.BOSS_ACTIVE
-            and not boss_in_frame[frame]
-            and frames_without_boss >= FRAMES_TO_END_ATTEMPT
-        ):
+        if state == State.NO_BOSS and frame_data[frame].boss_active:
+            if len(attempts) > 0:
+                time_from_last_attempt = frame_to_ms(frame) - frame_to_ms(attempts[-1][1])
+            else:
+                # when there were no attempts yet then we don't need a cooldown
+                time_from_last_attempt = MIN_MS_BETWEEN_ATTEMPTS
+
+            if time_from_last_attempt >= MIN_MS_BETWEEN_ATTEMPTS:
+                last_attempt_start = frame
+                state = State.ATTEMPT_STARTED
+
+        if state == State.ATTEMPT_STARTED and frame_data[frame].you_died_visible:
             end = frame
             attempts.append((last_attempt_start, end))
             state = State.NO_BOSS
-            print(f"attempt ended in frame {frame}")
 
     print()
     for idx, attempt in enumerate(attempts):
@@ -108,26 +132,15 @@ def print_results():
 
 
 with tqdm(desc=os.path.basename(vfile), total=frame_count) as progress:
-    should_end = False
-
     while cap.isOpened():
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            for i in range(THREADS_NUM):
-                ret, frame = cap.read()
-                if not ret:
-                    should_end = True
-                    break
-
-                frame_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
-
-                future = executor.submit(process_frame, frame)
-                future.add_done_callback(lambda _: progress.update())
-
-                boss_present = future.result()
-                boss_in_frame[frame_idx] = boss_present
-
-        if should_end:
+        ret, frame = cap.read()
+        if not ret:
             break
+
+        frame_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+        frame_data[frame_idx] = process_frame(frame, frame_idx)
+
+        progress.update()
 
 print_results()
 
