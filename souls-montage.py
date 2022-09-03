@@ -3,6 +3,7 @@
 
 import os
 import glob
+import math
 from enum import Enum
 
 import numpy as np
@@ -21,7 +22,7 @@ vfile = sorted(glob.glob("devclips/*.mp4"))[0]
 
 cap = cv2.VideoCapture(vfile)
 
-frames_per_sec = int(cap.get(cv2.CAP_PROP_FPS))
+frames_per_sec = cap.get(cv2.CAP_PROP_FPS)
 frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
 tmpl = cv2.imread("templates/bloodborne/ludwig_the_accursed.png", cv2.IMREAD_UNCHANGED)
@@ -41,12 +42,13 @@ class FrameData:
         self.you_died_visible = you_died_visible
 
     def __repr__(self):
-        return "-{}--{}-{}--{}--".format(
-            str(self.frame_idx).center(8, "-"),
+        return "--{}-{}--{}-{}--{}--".format(
+            ms_to_hms(frame_to_ms(self.frame_idx)),
+            str(self.frame_idx).ljust(8, "-"),
             "BOSS" if self.boss_active else "----",
-            str(int(self.boss_hp_pct)).rjust(4, "-")
+            str(int(self.boss_hp_pct)).rjust(3, "-")
             if self.boss_hp_pct != -1
-            else "----",
+            else "---",
             "DIED" if self.you_died_visible else "----",
         )
 
@@ -67,6 +69,14 @@ def frame_to_ms(frame_idx: int):
 
 def ms_to_frames(ms: int):
     return int(ms * (frames_per_sec / 1000))
+
+
+def ms_to_hms(ms: int):
+    s = math.floor(ms / 1000)
+    m = math.floor(s / 60)
+    h = math.floor(m / 60)
+
+    return "{:02d}:{:02d}:{:02d}".format(h, m % 60, s % 60)
 
 
 def get_box(frame, which: str):
@@ -156,9 +166,12 @@ def print_results():
     last_attempt_start = -1
     frames_without_boss = 0
 
+    logfile = open('.frame_data.log', 'w')
+
     for frame_idx in tqdm(sorted(frame_data.keys()), desc="Processing frame data"):
         frame = frame_data[frame_idx]
-        print(frame)
+
+        logfile.write(str(frame) + "\n")
 
         if frame.boss_active:
             frames_without_boss = 0
@@ -183,6 +196,8 @@ def print_results():
             end = frame_idx
             attempts.append((last_attempt_start, end, frame.boss_hp_pct))
             state = State.NO_BOSS
+
+    logfile.close()
 
     print()
     for idx, attempt in enumerate(attempts):
