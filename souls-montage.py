@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
+import os
 import math
 import argparse
 from enum import Enum
@@ -63,25 +64,23 @@ class VideoProcessor:
         self.boss_config = BOSS_CONFIG[boss]
         self.game_config = GAME_CONFIG[self.boss_config["game"]]
 
-        self.boss_name_tmpl = cv2.imread(
-            self.boss_config["boss_name_tmpl"], cv2.IMREAD_UNCHANGED
-        )
-        self.boss_name_tmpl = cv2.resize(
-            self.boss_name_tmpl, (0, 0), fx=RESIZE_FACTOR, fy=RESIZE_FACTOR
-        )
-
-        self.you_died_tmpl = cv2.imread(
-            self.game_config["you_died_tmpl"], cv2.IMREAD_UNCHANGED
-        )
-        self.you_died_tmpl = cv2.resize(
-            self.you_died_tmpl, (0, 0), fx=RESIZE_FACTOR, fy=RESIZE_FACTOR
-        )
+        self.boss_name_tmpl = self.get_tmpl(self.boss_config["boss_name_tmpl"])
+        self.you_died_tmpl = self.get_tmpl(self.game_config["you_died_tmpl"])
 
     def frame_to_ms(self, frame_idx: int):
         return int(frame_idx * (1 / self.frames_per_sec) * 1000)
 
     def ms_to_frames(self, ms: int):
         return int(ms * (self.frames_per_sec / 1000))
+
+    def get_tmpl(self, fname, resized=True, cv2_flag=cv2.IMREAD_UNCHANGED):
+        templates_dir = self.game_config["templates_dir"]
+        tmpl = cv2.imread(os.path.join(templates_dir, fname), cv2_flag)
+
+        if resized:
+            tmpl = cv2.resize(tmpl, (0, 0), fx=RESIZE_FACTOR, fy=RESIZE_FACTOR)
+
+        return tmpl
 
     def get_box(self, frame, which: str):
         height, width = frame.shape[0], frame.shape[1]
