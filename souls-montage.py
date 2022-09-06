@@ -16,6 +16,7 @@ import numpy as np
 import cv2
 from tqdm import tqdm
 from moviepy.editor import *
+import moviepy.video.fx.all as vfx
 
 from boss_config import *
 from game_config import *
@@ -415,8 +416,21 @@ class VideoProcessor:
 
         def get_clip(attempt: Attempt, start_s: int, end_s: int):
             clip = VideoFileClip(attempt.video_file)
-            print(f"Clipping {clip.filename} to {max(start_s, 0)} - {min(end_s, clip.duration)}")
-            return clip.subclip(max(start_s, 0), min(end_s, clip.duration))
+            start = max(start_s, 0)
+            end = min(end_s, clip.duration)
+
+            text = TextClip(f"Attempt #{attempt.id}",
+                            fontsize=48,
+                            color="white",
+                            font="Times-New-Roman")
+            text = text.on_color(col_opacity=0.25)
+            text = text.set_position(("left", "bottom"))
+            text = text.set_duration(end - start)
+            text = text.fx(vfx.margin, mar=20, opacity=0.25)
+
+            print(f"Clipping {clip.filename} to {start} - {end}")
+
+            return CompositeVideoClip([clip.subclip(start, end), text])
 
         if len(attempts) == 0:
             raise Exception("No attempts were found!")
