@@ -8,6 +8,7 @@ opencv-python = "*"
 numpy = "*"
 pillow = "*"
 tqdm = "*"
+moviepy = "*"
 
 [dev-packages]
 pylint = "*"

@@ -134,4 +134,7 @@ dmypy.json
 devclips/*
 !devclips/.gitkeep
 
+output
+
+.cache
 .frame_data.log

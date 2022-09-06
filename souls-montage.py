@@ -2,14 +2,20 @@
 # -*- coding: utf-8 -*-
 
 import os
+import sys
+import hashlib
+import pickle
+import mmap
 import math
 import argparse
 from enum import Enum
 import statistics
+from datetime import datetime as dt
 
 import numpy as np
 import cv2
 from tqdm import tqdm
+from moviepy.editor import *
 
 from boss_config import *
 from game_config import *
@@ -36,16 +42,55 @@ def ms_to_hms(ms: int, include_ms=False):
         return "{:02d}:{:02d}:{:02d}".format(h, m % 60, s % 60)
 
 
+def clamp(minimum, x, maximum):
+    return max(minimum, min(maximum, x))
+
+
+# https://gist.github.com/laundmo/b224b1f4c8ef6ca5fe47e132c8deab56
+def lerp(a: float, b: float, t: float) -> float:
+    """Linear interpolate on the scale given by a to b, using t as the point on that scale.
+    Examples
+    --------
+        50 == lerp(0, 100, 0.5)
+        4.2 == lerp(1, 5, 0.8)
+    """
+    return (1 - t) * a + t * b
+
+
+def inv_lerp(a: float, b: float, v: float) -> float:
+    """Inverse Linar Interpolation, get the fraction between a and b on which v resides.
+    Examples
+    --------
+        0.5 == inv_lerp(0, 100, 50)
+        0.8 == inv_lerp(1, 5, 4.2)
+    """
+    return (v - a) / (b - a)
+
+
+def remap(i_min: float, i_max: float, o_min: float, o_max: float, v: float) -> float:
+    """Remap values from one linear scale to another, a combination of lerp and inv_lerp.
+    i_min and i_max are the scale on which the original value resides,
+    o_min and o_max are the scale to which it should be mapped.
+    Examples
+    --------
+        45 == remap(0, 100, 40, 50, 50)
+        6.2 == remap(1, 5, 3, 7, 4.2)
+    """
+    return lerp(o_min, o_max, inv_lerp(i_min, i_max, v))
+
+
 class FrameData:
     video_file = ""
 
-    def __init__(self,
-                 frame_idx,
-                 time,
-                 boss_active=False,
-                 boss_hp_pct=-1,
-                 you_died_visible=False,
-                 win_message_visible=False):
+    def __init__(
+        self,
+        frame_idx,
+        time,
+        boss_active=False,
+        boss_hp_pct=-1,
+        you_died_visible=False,
+        win_message_visible=False,
+    ):
         self.frame_idx = frame_idx
         self.time = time
         self.boss_active = boss_active
@@ -58,8 +103,7 @@ class FrameData:
             self.time,
             str(self.frame_idx).ljust(8, "-"),
             "BOSS" if self.boss_active else "----",
-            str(int(self.boss_hp_pct)).rjust(3, "-")
-            if self.boss_hp_pct != -1 else "---",
+            str(int(self.boss_hp_pct)).rjust(3, "-") if self.boss_hp_pct != -1 else "---",
             "DIED" if self.you_died_visible else "----",
             "PREY" if self.win_message_visible else "----",
         )
@@ -67,8 +111,7 @@ class FrameData:
 
 class Attempt:
 
-    def __init__(self, id: int, video_file: str, start_ms: int, end_ms: int,
-                 victory: bool, boss_hp: int):
+    def __init__(self, id: int, video_file: str, start_ms: int, end_ms: int, victory: bool, boss_hp: int):
         assert end_ms > start_ms, "end_ms must be after start_ms"
 
         self.id = id
@@ -78,11 +121,27 @@ class Attempt:
         self.victory = victory
         self.boss_hp = boss_hp
 
+    @property
+    def start_s(self):
+        return self.start_ms / 1000
+
+    @property
+    def end_s(self):
+        return self.end_ms / 1000
+
+    @property
+    def length_ms(self):
+        return self.end_ms - self.start_ms
+
+    @property
+    def length_s(self):
+        return self.length_ms / 1000
+
     def __repr__(self):
         id = self.id
         hp = round(self.boss_hp, 1)
         status = "VICTORY" if self.victory else f"YOU DIED, {hp}%"
-        time = round((self.end_ms - self.start_ms) / 1000, 1)
+        time = round(self.length_s, 1)
         file = os.path.basename(self.video_file)
         start = ms_to_hms(self.start_ms, include_ms=True)
         end = ms_to_hms(self.end_ms, include_ms=True)
@@ -101,8 +160,7 @@ class VideoProcessor:
 
         self.boss_name_tmpl = self.get_tmpl(self.boss_config["boss_name_tmpl"])
         self.you_died_tmpl = self.get_tmpl(self.game_config["you_died_tmpl"])
-        self.win_message_tmpl = self.get_tmpl(
-            self.game_config[self.boss_config["win_message"] + "_tmpl"])
+        self.win_message_tmpl = self.get_tmpl(self.game_config[self.boss_config["win_message"] + "_tmpl"])
 
     def frame_to_ms(self, frame_idx: int):
         return int(frame_idx * (1 / self.frames_per_sec) * 1000)
@@ -134,7 +192,48 @@ class VideoProcessor:
 
         return frame[y1:y2, x1:x2]
 
+    def calculate_checksum(self, filename):
+        print(f"Calculating checksum of {filename}")
+
+        with open(filename, "rb") as f:
+            hash = hashlib.blake2b()
+            while chunk := f.read(mmap.PAGESIZE):
+                hash.update(chunk)
+
+        return hash.hexdigest()
+
+    def is_in_cache(self, filename) -> tuple[str, str]:
+        handle = self.calculate_checksum(filename)
+        cache_filename = f".cache/{handle}"
+
+        if os.path.exists(cache_filename):
+            return handle, cache_filename
+
+        return handle, None
+
+    def put_to_cache(self, handle, data):
+        cache_filename = f".cache/{handle}"
+
+        os.makedirs(os.path.dirname(cache_filename), exist_ok=True)
+        with open(cache_filename, "wb") as f:
+            pickle.dump(data, f)
+
+    def get_from_cache(self, checksum):
+        cache_filename = f".cache/{checksum}"
+
+        with open(cache_filename, "rb") as f:
+            return pickle.load(f)
+
     def process_video(self, filename):
+        cache_handle, cache_file = self.is_in_cache(filename)
+        if cache_file:
+            self.frames_per_sec, self.frame_count, self._frame_data = self.get_from_cache(cache_handle)
+            print(f"File {filename} not processed, since it's frame data is in cache")
+            return
+
+        if not os.path.exists(filename):
+            raise Exception(f"File {filename} not found!")
+
         cap = cv2.VideoCapture(filename)
 
         self.frames_per_sec = cap.get(cv2.CAP_PROP_FPS)
@@ -150,8 +249,7 @@ class VideoProcessor:
 
                 frames = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
                 frame_idx = frames + self.last_frame_idx
-                self._frame_data[frame_idx] = self.process_frame(
-                    frame, frame_idx)
+                self._frame_data[frame_idx] = self.process_frame(frame, frame_idx)
                 self._frame_data[frame_idx].video_file = filename
                 frames_processed += 1
 
@@ -161,34 +259,31 @@ class VideoProcessor:
 
         cap.release()
 
+        self.put_to_cache(cache_handle, (self.frames_per_sec, self.frame_count, self._frame_data))
+
     def process_frame(self, orig_frame, frame_idx) -> FrameData:
-        frame_data = FrameData(frame_idx,
-                               ms_to_hms(self.frame_to_ms(frame_idx)))
+        frame_data = FrameData(frame_idx, ms_to_hms(self.frame_to_ms(frame_idx)))
 
         frame = cv2.cvtColor(orig_frame, cv2.COLOR_BGR2GRAY)
         frame = cv2.resize(frame, (0, 0), fx=RESIZE_FACTOR, fy=RESIZE_FACTOR)
 
         _boss_name_tmpl = cv2.cvtColor(self.boss_name_tmpl, cv2.COLOR_BGR2GRAY)
         _you_died_tmpl = cv2.cvtColor(self.you_died_tmpl, cv2.COLOR_BGR2GRAY)
-        _win_message_tmpl = cv2.cvtColor(self.win_message_tmpl,
-                                         cv2.COLOR_BGR2GRAY)
+        _win_message_tmpl = cv2.cvtColor(self.win_message_tmpl, cv2.COLOR_BGR2GRAY)
 
         you_died_box = self.get_box(frame, "you_died")
-        match = cv2.matchTemplate(you_died_box, _you_died_tmpl,
-                                  cv2.TM_CCOEFF_NORMED)
+        match = cv2.matchTemplate(you_died_box, _you_died_tmpl, cv2.TM_CCOEFF_NORMED)
         if np.amax(match) > 0.5:
             frame_data.you_died_visible = True
 
         win_message_box = self.get_box(frame, self.boss_config["win_message"])
-        match = cv2.matchTemplate(win_message_box, _win_message_tmpl,
-                                  cv2.TM_CCOEFF_NORMED)
+        match = cv2.matchTemplate(win_message_box, _win_message_tmpl, cv2.TM_CCOEFF_NORMED)
         if np.amax(match) > 0.5:
             frame_data.win_message_visible = True
 
         # try to find the boss' name
         boss_bar_box = self.get_box(frame, "boss_bar")
-        match = cv2.matchTemplate(boss_bar_box, _boss_name_tmpl,
-                                  cv2.TM_CCORR_NORMED)
+        match = cv2.matchTemplate(boss_bar_box, _boss_name_tmpl, cv2.TM_CCORR_NORMED)
         boss_active_confidence = np.amax(match)
 
         # and try to see if the boss' hp bar is active
@@ -204,10 +299,8 @@ class VideoProcessor:
         img = np.ones((1, 1, 3), dtype=np.uint8)
         img[:, :] = centers[0]
 
-        lowerb = hex_to_cv2_color(
-            self.game_config["boss_bar_dominant_color_lower_bound"])
-        upperb = hex_to_cv2_color(
-            self.game_config["boss_bar_dominant_color_upper_bound"])
+        lowerb = hex_to_cv2_color(self.game_config["boss_bar_dominant_color_lower_bound"])
+        upperb = hex_to_cv2_color(self.game_config["boss_bar_dominant_color_upper_bound"])
         mask = cv2.inRange(img, lowerb, upperb)
 
         # bump the confidence by a fair amount if the dominant color of the boss' hp
@@ -240,7 +333,7 @@ class VideoProcessor:
 
         return frame_data
 
-    def process_frame_data(self):
+    def process_frame_data(self) -> list[Attempt]:
 
         class State(Enum):
             NO_BOSS = 0
@@ -255,14 +348,18 @@ class VideoProcessor:
         attempts: list[Attempt] = []
         next_attempt_id = 1
 
-        def add_attempt(frame: FrameData, start_frame_idx: int,
-                        end_frame_idx: int, victory: bool, boss_hp: int):
+        def add_attempt(frame: FrameData, start_frame_idx: int, end_frame_idx: int, victory: bool, boss_hp: int):
             nonlocal next_attempt_id
 
             attempts.append(
-                Attempt(next_attempt_id, frame.video_file,
-                        self.frame_to_ms(start_frame_idx),
-                        self.frame_to_ms(end_frame_idx), victory, boss_hp))
+                Attempt(
+                    next_attempt_id,
+                    frame.video_file,
+                    self.frame_to_ms(start_frame_idx),
+                    self.frame_to_ms(end_frame_idx),
+                    victory,
+                    boss_hp,
+                ))
 
             next_attempt_id += 1
 
@@ -307,29 +404,116 @@ class VideoProcessor:
                     final_boss_hp = statistics.mode(you_died_boss_hps)
                     you_died_boss_hps = []
 
-                    add_attempt(frame, last_attempt_start,
-                                you_died_start_frame_idx, False, final_boss_hp)
+                    add_attempt(frame, last_attempt_start, you_died_start_frame_idx, False, final_boss_hp)
                     state = State.NO_BOSS
 
         logfile.close()
 
         return attempts
 
+    def generate_clips(self, attempts: list[Attempt], target_video_length: int):
+
+        def get_clip(attempt: Attempt, start_s: int, end_s: int):
+            clip = VideoFileClip(attempt.video_file)
+            print(f"Clipping {clip.filename} to {max(start_s, 0)} - {min(end_s, clip.duration)}")
+            return clip.subclip(max(start_s, 0), min(end_s, clip.duration))
+
+        if len(attempts) == 0:
+            raise Exception("No attempts were found!")
+
+        if len(attempts) == 1:
+            attempt = attempts[0]
+            # if we have only 1 attempt then let's return it in it's entirety
+            return [get_clip(attempt, attempt.start_s, attempt.end_s)]
+
+        if len(attempts) == 2:
+            first, second = attempts
+
+            # likewise, if we have 2 then just return both
+            return [
+                get_clip(first, first.start_s, first.end_s),
+                get_clip(second, second.start_s, second.end_s),
+            ]
+
+        clips = []
+
+        secs_before_first = 15
+        secs_before_last = 5
+        secs_after_last = 30
+        max_attempt_duration = 10
+        min_attempt_duration = 3
+        you_died_duration = int(self.game_config["you_died_duration_ms"] / 1000)
+        delay_before_you_died = int(self.game_config["delay_before_you_died_appears_ms"] / 1000)
+
+        # give a bit of time before the first attempt start
+        first_start = attempts[0].start_s - secs_before_first
+        # and show it till YOU DIED dissappears
+        first_end = attempts[0].end_s + you_died_duration
+        first_length = first_end - first_start
+
+        # likewise, start the last attempt 1 second early
+        last_start = attempts[-1].start_s - secs_before_last
+        # and end it after some time (very precise, much wow)
+        last_end = attempts[-1].end_s + you_died_duration + secs_after_last
+        last_length = last_end - last_start
+
+        # insert the first attempt
+        clips.append(get_clip(attempts[0], first_start, first_end))
+
+        # roughly calculate how much each mid-attempt should take
+        if target_video_length > 0:
+            mid_attempt_avg_length = target_video_length - (first_length + last_length) / (len(attempts) - 2)
+        else:
+            # when we don't have the target video length we need to think for ourselves
+            mid_attempt_avg_length = remap(1, 200, max_attempt_duration, min_attempt_duration, len(attempts) - 2)
+
+        mid_attempt_avg_length = clamp(min_attempt_duration, mid_attempt_avg_length, max_attempt_duration)
+
+        for attempt in attempts[1:-1]:
+            end_s = attempt.end_s - delay_before_you_died
+            start_s = end_s - mid_attempt_avg_length
+            # make sure we don't clip before the attempt has actually started
+            start_s = max(attempt.start_s, start_s)
+
+            clips.append(get_clip(attempt, start_s, end_s))
+
+        # insert the last attempt
+        clips.append(get_clip(attempts[-1], last_start, last_end))
+
+        return clips
+
+
+class HMStoSAction(argparse.Action):
+
+    def __init__(self, option_strings, dest, nargs=None, **kwargs):
+        if nargs is not None:
+            raise ValueError("nargs not allowed")
+        super().__init__(option_strings, dest, **kwargs)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        try:
+            try:
+                delta = dt.strptime(values, "%H:%M:%S") - dt(1900, 1, 1)
+            except ValueError:
+                delta = dt.strptime(values, "%M:%S") - dt(1900, 1, 1)
+        except:
+            raise argparse.ArgumentTypeError(f"invalid format for option {option_string} - use MM:SS or HH:MM:SS")
+
+        seconds = delta.total_seconds()
+        setattr(namespace, self.dest, seconds)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Souls montage")
-    parser.add_argument("input_videos",
-                        metavar="video",
-                        type=str,
-                        nargs="+",
-                        help="video(s) to process")
-    parser.add_argument("-b",
-                        "--boss",
-                        type=str,
-                        choices=BOSS_CONFIG.keys(),
-                        required=True)
+    parser.add_argument("input_videos", metavar="video", type=str, nargs="+", help="video(s) to process")
+    parser.add_argument("-b", "--boss", type=str, choices=BOSS_CONFIG.keys(), required=True)
+    parser.add_argument("-t", "--target-video-length", type=str, action=HMStoSAction, default=-1)
 
-    args = parser.parse_args()
+    try:
+        args = parser.parse_args()
+    except (argparse.ArgumentTypeError, argparse.ArgumentError) as exc:
+        parser.error(exc)
+        sys.exit(1)
 
     processor = VideoProcessor(args.boss)
 
@@ -339,3 +523,16 @@ if __name__ == "__main__":
     attempts = processor.process_frame_data()
     for attempt in attempts:
         print(attempt)
+
+    clips = processor.generate_clips(attempts, args.target_video_length)
+
+    boss_name = processor.boss_config['full_name']
+    datetime = dt.now().strftime('%Y%m%d%H%M%S')
+    final_video_name = f"output/{boss_name} {datetime}.mp4".replace(" ", "_")
+
+    os.makedirs(os.path.dirname(final_video_name), exist_ok=True)
+
+    final_video = concatenate_videoclips(clips)
+    final_video.write_videofile(final_video_name)
+
+    print(f"Video written to {final_video_name}")
