@@ -32,8 +32,17 @@ BOSS_CONFIG = {
   "ludwig": {
     "full_name": "Ludwig, the Holy Blade",
     "game": "bloodborne",
-    "boss_name_tmpl": "ludwig_the_accursed.png",
     "win_message": "prey_slaughtered",
+    "phases": [
+      {
+        "threshold": 100,
+        "boss_name_tmpl": "ludwig_the_accursed.png",
+      },
+      {
+        "threshold": 50,
+        "boss_name_tmpl": "ludwig_the_holy_blade.png",
+      }
+    ]
   },
   "mergos": {
     "full_name": "Mergo's Wet Nurse",

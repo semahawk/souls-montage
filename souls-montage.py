@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
+import functools
 import os
 import sys
 import hashlib
@@ -90,6 +91,7 @@ class FrameData:
 
     def __init__(
         self,
+        video_file,
         frame_idx,
         time,
         boss_active=False,
@@ -97,6 +99,7 @@ class FrameData:
         you_died_visible=False,
         win_message_visible=False,
     ):
+        self.video_file = video_file
         self.frame_idx = frame_idx
         self.time = time
         self.boss_active = boss_active
@@ -105,13 +108,14 @@ class FrameData:
         self.win_message_visible = win_message_visible
 
     def __repr__(self):
-        return "--{}-{}--{}-{}--{}--{}--".format(
+        return "--{}-{}--{}-{}--{}--{}-- {}".format(
             self.time,
             str(self.frame_idx).ljust(8, "-"),
             "BOSS" if self.boss_active else "----",
             str(int(self.boss_hp_pct)).rjust(3, "-") if self.boss_hp_pct != -1 else "---",
             "DIED" if self.you_died_visible else "----",
             "PREY" if self.win_message_visible else "----",
+            self.video_file
         )
 
 
@@ -165,7 +169,7 @@ class ClippedAttempt(Attempt):
 
 
 class VideoProcessor:
-    _frame_data: dict[int, FrameData] = {}
+    _frame_data: dict[str, dict[int, FrameData]] = {}
 
     def __init__(self, boss):
         self.last_frame_idx = 0
@@ -173,7 +177,13 @@ class VideoProcessor:
         self.boss_config = BOSS_CONFIG[boss]
         self.game_config = GAME_CONFIG[self.boss_config["game"]]
 
-        self.boss_name_tmpl = self.get_tmpl(self.boss_config["boss_name_tmpl"])
+        # some bosses (like Ludwig) change name between phases
+        if "phases" in self.boss_config:
+            names = [p["boss_name_tmpl"] for p in self.boss_config["phases"]]
+            self.boss_name_tmpls = [self.get_tmpl(name) for name in names]
+        else:
+            self.boss_name_tmpls = [self.get_tmpl(self.boss_config["boss_name_tmpl"])]
+
         self.you_died_tmpl = self.get_tmpl(self.game_config["you_died_tmpl"])
         self.win_message_tmpl = self.get_tmpl(self.game_config[self.boss_config["win_message"] + "_tmpl"])
 
@@ -211,10 +221,11 @@ class VideoProcessor:
 
         return frame[y1:y2, x1:x2]
     
-    def add_frame_data(self, frame_data: dict[int, FrameData]):
-        for frame_idx in sorted(frame_data.keys()):
-            self._frame_data[self.last_frame_idx] = frame_data[frame_idx]
-            self.last_frame_idx += 1
+    def add_frame_data(self, filename, frame_data: dict[int, FrameData]):
+        self._frame_data[filename] = frame_data
+        # for frame_idx in sorted(frame_data.keys()):
+        #     self._frame_data[self.last_frame_idx] = frame_data[frame_idx]
+        #     self.last_frame_idx += 1
 
     def calculate_checksum(self, filename):
         print(f"Calculating checksum of {filename}")
@@ -252,7 +263,7 @@ class VideoProcessor:
         cache_handle, cache_file = self.is_in_cache(filename)
         if cache_file:
             self.frames_per_sec, frame_data = self.get_from_cache(cache_handle)
-            self.add_frame_data(frame_data)
+            self.add_frame_data(filename, frame_data)
 
             print(f"File {filename} not processed, since it's frame data is in cache")
             return
@@ -274,30 +285,28 @@ class VideoProcessor:
                 if not ret:
                     break
 
-                frame_data[frame_idx] = self.process_frame(frame, frame_idx)
-                frame_data[frame_idx].video_file = filename
+                frame_data[frame_idx] = self.process_frame(filename, frame, frame_idx)
                 frame_idx += 1
 
                 progress.update()
 
         cap.release()
 
-        self.add_frame_data(frame_data)
+        self.add_frame_data(filename, frame_data)
         self.put_to_cache(cache_handle, (self.frames_per_sec, frame_data))
 
-    def process_frame(self, orig_frame, frame_idx) -> FrameData:
-        frame_data = FrameData(frame_idx, ms_to_hms(self.frame_to_ms(frame_idx)))
+    def process_frame(self, filename, orig_frame, frame_idx) -> FrameData:
+        frame_data = FrameData(filename, frame_idx, ms_to_hms(self.frame_to_ms(frame_idx)))
 
         frame = cv2.cvtColor(orig_frame, cv2.COLOR_BGR2GRAY)
         frame = cv2.resize(frame, (0, 0), fx=RESIZE_FACTOR, fy=RESIZE_FACTOR)
 
-        _boss_name_tmpl = cv2.cvtColor(self.boss_name_tmpl, cv2.COLOR_BGR2GRAY)
         _you_died_tmpl = cv2.cvtColor(self.you_died_tmpl, cv2.COLOR_BGR2GRAY)
         _win_message_tmpl = cv2.cvtColor(self.win_message_tmpl, cv2.COLOR_BGR2GRAY)
 
         you_died_box = self.get_box(frame, "you_died")
         match = cv2.matchTemplate(you_died_box, _you_died_tmpl, cv2.TM_CCOEFF_NORMED)
-        if np.amax(match) > 0.5:
+        if np.amax(match) > 0.3:
             frame_data.you_died_visible = True
 
         win_message_box = self.get_box(frame, self.boss_config["win_message"])
@@ -306,9 +315,15 @@ class VideoProcessor:
             frame_data.win_message_visible = True
 
         # try to find the boss' name
+        # actually, check all of the bosses names and pick the one with the highest confidence
+        # as some bosses change name during the fight (eg. Ludwig)
         boss_bar_box = self.get_box(frame, "boss_bar")
-        match = cv2.matchTemplate(boss_bar_box, _boss_name_tmpl, cv2.TM_CCORR_NORMED)
-        boss_active_confidence = np.amax(match)
+        for boss_name_tmpl in self.boss_name_tmpls:
+            _boss_name_tmpl = cv2.cvtColor(boss_name_tmpl, cv2.COLOR_BGR2GRAY)
+            match = cv2.matchTemplate(boss_bar_box, _boss_name_tmpl, cv2.TM_CCORR_NORMED)
+            boss_active_confidence = np.amax(match)
+            if boss_active_confidence > 0.85:
+                break
 
         # and try to see if the boss' hp bar is active
         # by checking the dominant color of this area and checking if in range
@@ -336,6 +351,7 @@ class VideoProcessor:
             frame_data.boss_active = True
 
         # calculate how much hp the boss has (if decently confident that boss is active)
+        # if True: # TODO implement knowledge of multi-phases
         if boss_active_confidence > 0.85:
             # when YOU DIED is visible then the screen has a semi-transparent overlay
             # making the white more gray
@@ -389,47 +405,54 @@ class VideoProcessor:
 
         logfile = open(".frame_data.log", "w")
 
-        sorted_frames = sorted(self._frame_data.keys())
-        for frame_idx in tqdm(sorted_frames, desc="Processing frame data"):
-            frame = self._frame_data[frame_idx]
+        for video_file, frame_data in self._frame_data.items():
+            sorted_frames = sorted(frame_data.keys())
 
-            logfile.write(str(frame) + "\n")
+            for frame_idx in tqdm(sorted_frames, desc="Processing frame data"):
+                frame = frame_data[frame_idx]
 
-            if state == State.NO_BOSS and frame.boss_active:
-                if len(attempts) > 0:
-                    current = self.frame_to_ms(frame_idx)
-                    last = attempts[-1].end_ms
-                    # calculate how much time elapsed since the last attempt ended
-                    time_from_last_attempt = current - last
-                else:
-                    # when there were no attempts yet then we don't need a cooldown
-                    time_from_last_attempt = MIN_MS_BETWEEN_ATTEMPTS
+                logfile.write(str(frame) + "\n")
 
-                if time_from_last_attempt >= MIN_MS_BETWEEN_ATTEMPTS:
-                    last_attempt_start = frame_idx
-                    state = State.ATTEMPT_STARTED
+                if state == State.NO_BOSS and frame.boss_active:
+                    if len(attempts) > 0:
+                        if video_file == attempts[-1].video_file:
+                            current = self.frame_to_ms(frame_idx)
+                            last = attempts[-1].end_ms
+                            # calculate how much time elapsed since the last attempt ended
+                            time_from_last_attempt = current - last
+                        else:
+                            # if we've switched video files then there's no need for a cooldown
+                            time_from_last_attempt = MIN_MS_BETWEEN_ATTEMPTS
+                    else:
+                        # when there were no attempts yet then we don't need a cooldown
+                        time_from_last_attempt = MIN_MS_BETWEEN_ATTEMPTS
 
-            elif state == State.ATTEMPT_STARTED and frame.you_died_visible:
-                you_died_start_frame_idx = frame_idx
-                state = State.CURRENTLY_DYING
+                    if time_from_last_attempt >= MIN_MS_BETWEEN_ATTEMPTS:
+                        last_attempt_start = frame_idx
+                        state = State.ATTEMPT_STARTED
 
-            elif state == State.ATTEMPT_STARTED and frame.win_message_visible:
-                add_attempt(frame, last_attempt_start, frame_idx, True, 0)
-                state = State.NO_BOSS
+                elif state == State.ATTEMPT_STARTED and frame.you_died_visible:
+                    you_died_start_frame_idx = frame_idx
+                    state = State.CURRENTLY_DYING
 
-            elif state == State.CURRENTLY_DYING:
-                if frame.you_died_visible:
-                    you_died_boss_hps.append(frame.boss_hp_pct)
-                else:
-                    # decide the final boss hp based on what number comes up
-                    # most often in the frame data while "YOU DIED" is visible
-                    # this is to prevent misreads on single frames to mess with
-                    # the final reading
-                    final_boss_hp = statistics.mode(you_died_boss_hps)
-                    you_died_boss_hps = []
-
-                    add_attempt(frame, last_attempt_start, you_died_start_frame_idx, False, final_boss_hp)
+                elif state == State.ATTEMPT_STARTED and frame.win_message_visible:
+                    add_attempt(frame, last_attempt_start, frame_idx, True, 0)
                     state = State.NO_BOSS
+
+                elif state == State.CURRENTLY_DYING:
+                    if frame.you_died_visible:
+                        if frame.boss_hp_pct >= 0:
+                            you_died_boss_hps.append(frame.boss_hp_pct)
+                    else:
+                        # decide the final boss hp based on what number comes up
+                        # most often in the frame data while "YOU DIED" is visible
+                        # this is to prevent misreads on single frames to mess with
+                        # the final reading
+                        final_boss_hp = statistics.mode(you_died_boss_hps)
+                        you_died_boss_hps = []
+
+                        add_attempt(frame, last_attempt_start, you_died_start_frame_idx, False, final_boss_hp)
+                        state = State.NO_BOSS
 
         logfile.close()
 
@@ -512,15 +535,11 @@ class VideoProcessor:
 
         for attempt in attempts[1:-1]:
             end_s = attempt.end_s - delay_before_you_died
-            print(f"start_s = {end_s} - {mid_attempt_avg_length}")
             start_s = end_s - mid_attempt_avg_length
             # make sure we don't clip before the attempt has actually started
             start_s = max(attempt.start_s, start_s)
-            print(f"start_s = max({attempt.start_s}, {start_s})")
-            print(f"start_s = {start_s}, end_s = {end_s}")
 
             clips.append(get_clip(attempt, start_s, end_s))
-            print()
 
         # insert the last attempt
         clips.append(get_clip(attempts[-1], last_start, last_end))
@@ -630,7 +649,9 @@ if __name__ == "__main__":
     for file in sorted(args.input_videos):
         processor.process_video(file)
 
-    total = sorted(processor._frame_data.keys())[-1]
+    # count the total number of frames
+    # total = sorted(processor._frame_data.keys())[-1]
+    total = functools.reduce(lambda acc, frames: acc + len(frames), processor._frame_data.values(), 0)
     total = processor.frame_to_ms(total)
     total = ms_to_hms(total)
 
@@ -655,7 +676,7 @@ if __name__ == "__main__":
         print(clipped_attempt)
     print()
 
-    # final_video = processor.generate_final_video(clipped_attempts)
-    # final_video.write_videofile(final_video_name)
+    final_video = processor.generate_final_video(clipped_attempts)
+    final_video.write_videofile(final_video_name)
 
-    # print(f"\nVideo written to {final_video_name}")
+    print(f"\nVideo written to {final_video_name}")
