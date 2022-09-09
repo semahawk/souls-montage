@@ -9,6 +9,7 @@ numpy = "*"
 pillow = "*"
 tqdm = "*"
 moviepy = "*"
+matplotlib = "*"
 
 [dev-packages]
 pylint = "*"
