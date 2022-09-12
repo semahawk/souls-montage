@@ -161,11 +161,11 @@ class Attempt:
 
 class ClippedAttempt(Attempt):
 
-    def __init__(self, clip, source=None):
+    def __init__(self, clip_file, source=None):
         if source is not None:
             self.__dict__.update(source.__dict__)
 
-        self.clip = clip
+        self.clip_file = clip_file
 
 
 class VideoProcessor:
@@ -176,6 +176,7 @@ class VideoProcessor:
 
         self.boss_config = BOSS_CONFIG[boss]
         self.game_config = GAME_CONFIG[self.boss_config["game"]]
+        self.boss_config["_name"] = boss
 
         # some bosses (like Ludwig) change name between phases
         if "phases" in self.boss_config:
@@ -466,19 +467,32 @@ class VideoProcessor:
             start = max(start_s, 0)
             # start = end - 1
 
-            text = TextClip(f"Attempt #{attempt.id}", fontsize=48, color="white", font="Times-New-Roman")
-            text = text.on_color(col_opacity=0.25)
-            text = text.fx(vfx.margin, mar=20, opacity=0.25)
-            text = text.set_position((0, video.h * 0.75 - text.h))
-            text = text.set_duration(end - start)
+            short_hash = hashlib.blake2b(attempt.video_file.encode('utf-8')).hexdigest()[0:7]
+            boss_name = self.boss_config["_name"]
+            clip_name = f".cache/clips/{boss_name}_{attempt.id:03d}_{short_hash}_{start}_{end}.mp4"
+            
+            if os.path.exists(clip_name):
+                print(f"Using clip {clip_name}")
+            else:
+                print(f"Clipping {attempt.video_file} @ {start} - {end} to {clip_name}")
 
-            print(f"Clipping {attempt.video_file} to {start} - {end}")
-            clip = video.subclip(start, end)
-            clip = CompositeVideoClip([clip, text])
+                text = TextClip(f"Attempt #{attempt.id}", fontsize=48, color="white", font="Times-New-Roman")
+                text = text.on_color(col_opacity=0.25)
+                text = text.fx(vfx.margin, mar=20, opacity=0.25)
+                text = text.set_position((0, video.h * 0.75 - text.h))
+                text = text.set_duration(end - start)
 
-            clipped_attempt = ClippedAttempt(clip, source=attempt)
+                os.makedirs(os.path.dirname(clip_name), exist_ok=True)
+                clip = video.subclip(start, end)
+                clip = CompositeVideoClip([clip, text])
+                clip.write_videofile(clip_name, preset="ultrafast", threads=4)
+                clip.close()
+
+            clipped_attempt = ClippedAttempt(clip_name, source=attempt)
             clipped_attempt.start_ms = start * 1000
             clipped_attempt.end_ms = end * 1000
+
+            video.close()
 
             return clipped_attempt
 
@@ -547,7 +561,7 @@ class VideoProcessor:
         return clips
 
     def generate_final_video(self, clipped_attempts: list[ClippedAttempt]):
-        clips = concatenate_videoclips([ca.clip for ca in clipped_attempts])
+        clips = concatenate_videoclips([VideoFileClip(ca.clip_file) for ca in clipped_attempts], method="chain")
         
         # "transpose" the attempts (ie. adjust start and end times to what they will
         # actually be in the final, concatenated clip)
@@ -586,11 +600,11 @@ class VideoProcessor:
                 ax.set_xticks([])
                 return mplfig_to_npimage(fig)
 
-            x = [i for i, a in enumerate(clipped_attempts[0:attempt_at_t+1])]
-            y = [a.boss_hp for a in clipped_attempts[0:attempt_at_t+1]]
+            x = [i for i, a in enumerate(clipped_attempts[0:attempt_at_t])]
+            y = [a.boss_hp for a in clipped_attempts[0:attempt_at_t]]
 
             ax.plot(x, y, scaley=True, scalex=True, lw=2, color="#cf5e25")
-            ax.fill_between(x, y, alpha=0.1, facecolor="#cf5e25")
+            # ax.fill_between(x, y, alpha=0.1, facecolor="#cf5e25")
             ax.xaxis.set_minor_locator(MultipleLocator(1))
             ax.xaxis.set_minor_formatter(ScalarFormatter())
 
@@ -677,6 +691,6 @@ if __name__ == "__main__":
     print()
 
     final_video = processor.generate_final_video(clipped_attempts)
-    final_video.write_videofile(final_video_name)
+    final_video.write_videofile(final_video_name, preset="ultrafast", threads=4)
 
     print(f"\nVideo written to {final_video_name}")
