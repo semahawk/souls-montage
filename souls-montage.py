@@ -21,6 +21,7 @@ from moviepy.editor import *
 import moviepy.video.fx.all as vfx
 import matplotlib.pyplot as plt
 from moviepy.video.io.bindings import mplfig_to_npimage
+from moviepy.video.io.ffmpeg_tools import ffmpeg_concat_videos
 from matplotlib.ticker import MultipleLocator, ScalarFormatter
 
 from boss_config import *
@@ -224,9 +225,6 @@ class VideoProcessor:
     
     def add_frame_data(self, filename, frame_data: dict[int, FrameData]):
         self._frame_data[filename] = frame_data
-        # for frame_idx in sorted(frame_data.keys()):
-        #     self._frame_data[self.last_frame_idx] = frame_data[frame_idx]
-        #     self.last_frame_idx += 1
 
     def calculate_checksum(self, filename):
         print(f"Calculating checksum of {filename}")
@@ -352,7 +350,6 @@ class VideoProcessor:
             frame_data.boss_active = True
 
         # calculate how much hp the boss has (if decently confident that boss is active)
-        # if True: # TODO implement knowledge of multi-phases
         if boss_active_confidence > 0.85:
             # when YOU DIED is visible then the screen has a semi-transparent overlay
             # making the white more gray
@@ -465,7 +462,6 @@ class VideoProcessor:
             video = VideoFileClip(attempt.video_file)
             end = min(end_s, video.duration)
             start = max(start_s, 0)
-            # start = end - 1
 
             short_hash = hashlib.blake2b(attempt.video_file.encode('utf-8')).hexdigest()[0:7]
             boss_name = self.boss_config["_name"]
@@ -476,16 +472,51 @@ class VideoProcessor:
             else:
                 print(f"Clipping {attempt.video_file} @ {start} - {end} to {clip_name}")
 
+                subclip = video.subclip(start, end)
+
+                px = 1 / plt.rcParams['figure.dpi'] # pixel in inches
+                # create the plot (as wide as the clip, and 1/4 of height)
+                fig, ax = plt.subplots(figsize=(video.w * px, video.h * px * 0.25), facecolor="#000000")
+
+                fig.tight_layout()
+                ax.set_facecolor("#000000")
+                ax.spines["top"].set_visible(False)
+                ax.spines["right"].set_visible(False)
+                ax.spines["left"].set_visible(False)
+                ax.spines["bottom"].set_visible(False)
+                ax.yaxis.grid(color="#333333")
+                ax.set_ylim(0, 100)
+                ax.set_xticks([])
+                ax.xaxis.set_minor_locator(MultipleLocator(1))
+                ax.xaxis.set_minor_formatter(ScalarFormatter())
+                ax.tick_params(axis ='both', which ='both', labelsize = 8, pad = 12, colors ='white')
+                ax.set_alpha(0.25)
+                ax.patch.set_alpha(0.25)
+
+                x = [a.id for a in attempts[0:attempt.id-1]]
+                y = [a.boss_hp for a in attempts[0:attempt.id-1]]
+
+                ax.plot(x, y, scaley=True, scalex=True, lw=2, color="#cf5e25")
+
+                chart = ImageClip(mplfig_to_npimage(fig), duration=subclip.duration)
+                chart = chart.fx(vfx.mask_color, color=(0, 0, 0))
+                chart = chart.on_color(col_opacity=0.5)
+                chart = chart.fx(vfx.margin, mar=20, opacity=0.5)
+                chart = chart.set_position(("center", "bottom"))
+
                 text = TextClip(f"Attempt #{attempt.id}", fontsize=48, color="white", font="Times-New-Roman")
                 text = text.on_color(col_opacity=0.25)
                 text = text.fx(vfx.margin, mar=20, opacity=0.25)
-                text = text.set_position((0, video.h * 0.75 - text.h))
+                text = text.set_position((0, video.h - chart.h - text.h))
                 text = text.set_duration(end - start)
 
+                if attempt.id == 1:
+                    clip = CompositeVideoClip([subclip, text])
+                else:
+                    clip = CompositeVideoClip([subclip, chart, text])
+
                 os.makedirs(os.path.dirname(clip_name), exist_ok=True)
-                clip = video.subclip(start, end)
-                clip = CompositeVideoClip([clip, text])
-                clip.write_videofile(clip_name, preset="ultrafast", threads=4)
+                clip.write_videofile(clip_name, preset="ultrafast", threads=8)
                 clip.close()
 
             clipped_attempt = ClippedAttempt(clip_name, source=attempt)
@@ -560,70 +591,10 @@ class VideoProcessor:
 
         return clips
 
-    def generate_final_video(self, clipped_attempts: list[ClippedAttempt]):
-        clips = concatenate_videoclips([VideoFileClip(ca.clip_file) for ca in clipped_attempts], method="chain")
-        
-        # "transpose" the attempts (ie. adjust start and end times to what they will
-        # actually be in the final, concatenated clip)
-        transposed = [copy.copy(a) for a in clipped_attempts]
-        next_start_ms = 0
-        for a in transposed:
-            duration = a.end_ms - a.start_ms
-            a.start_ms = next_start_ms
-            a.end_ms = a.start_ms + duration
-            next_start_ms = a.end_ms
-
-        px = 1 / plt.rcParams['figure.dpi'] # pixel in inches
-        # create the plot (as wide as the clips, and 1/4 of height)
-        fig, ax = plt.subplots(figsize=(clips.w * px, clips.h * px * 0.25), facecolor="#000000")
-
-        fig.tight_layout()
-        ax.set_facecolor("#000000")
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
-        ax.spines["left"].set_visible(False)
-        ax.spines["bottom"].set_visible(False)
-        ax.yaxis.grid()
-        ax.set_xticks([])
-
-        def make_frame(t):
-            ax.clear()
-            ax.set_ylim(0, 100)
-
-            attempt_at_t = None
-            for attempt_idx, attempt in enumerate(transposed):
-                if attempt.start_ms <= t * 1000 < attempt.end_ms:
-                    attempt_at_t = attempt_idx
-                    break
-
-            if not attempt_at_t:
-                ax.set_xticks([])
-                return mplfig_to_npimage(fig)
-
-            x = [i for i, a in enumerate(clipped_attempts[0:attempt_at_t])]
-            y = [a.boss_hp for a in clipped_attempts[0:attempt_at_t]]
-
-            ax.plot(x, y, scaley=True, scalex=True, lw=2, color="#cf5e25")
-            # ax.fill_between(x, y, alpha=0.1, facecolor="#cf5e25")
-            ax.xaxis.set_minor_locator(MultipleLocator(1))
-            ax.xaxis.set_minor_formatter(ScalarFormatter())
-
-            ax.tick_params(axis ='both', which ='both', labelsize = 8, pad = 12, colors ='white')
-            ax.yaxis.grid(color="#333333")
-            ax.set_alpha(0.25)
-            ax.patch.set_alpha(0.25)
-
-            return mplfig_to_npimage(fig)
-
-        chart = VideoClip(make_frame, duration=clips.duration)
-        chart = chart.fx(vfx.mask_color, color=(0, 0, 0))
-        chart = chart.on_color(col_opacity=0.5)
-        # chart = chart.fx(vfx.margin, mar=20, opacity=0.5)
-        chart = chart.set_position(("center", "bottom"))
-        # chart.fps = 30
-
-        return CompositeVideoClip([clips, chart])
-        # return chart
+    def generate_final_video(self, filename, clipped_attempts: list[ClippedAttempt]):
+        os.makedirs(os.path.dirname(final_video_name), exist_ok=True)
+        # TODO: take the fps from the clip(s)
+        ffmpeg_concat_videos([os.path.abspath(ca.clip_file) for ca in clipped_attempts], filename, 29.97)
 
 
 class HMStoSAction(argparse.Action):
@@ -664,7 +635,6 @@ if __name__ == "__main__":
         processor.process_video(file)
 
     # count the total number of frames
-    # total = sorted(processor._frame_data.keys())[-1]
     total = functools.reduce(lambda acc, frames: acc + len(frames), processor._frame_data.values(), 0)
     total = processor.frame_to_ms(total)
     total = ms_to_hms(total)
@@ -679,18 +649,14 @@ if __name__ == "__main__":
 
     clipped_attempts = processor.clip_attempts(attempts, args.target_video_length)
 
-    boss_name = processor.boss_config['full_name']
-    datetime = dt.now().strftime('%Y%m%d%H%M%S')
-    final_video_name = f"output/{boss_name} {datetime}.mp4".replace(" ", "_")
-
-    os.makedirs(os.path.dirname(final_video_name), exist_ok=True)
-
     print("\nClipped attempts:")
     for clipped_attempt in clipped_attempts:
         print(clipped_attempt)
     print()
 
-    final_video = processor.generate_final_video(clipped_attempts)
-    final_video.write_videofile(final_video_name, preset="ultrafast", threads=4)
+    boss_name = processor.boss_config['full_name']
+    datetime = dt.now().strftime('%Y%m%d%H%M%S')
+    final_video_name = f"output/{boss_name} {datetime}.mp4".replace(" ", "_")
+    final_video = processor.generate_final_video(final_video_name, clipped_attempts)
 
     print(f"\nVideo written to {final_video_name}")
